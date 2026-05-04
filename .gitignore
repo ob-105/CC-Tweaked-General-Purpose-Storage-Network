@@ -1,0 +1,7 @@
+# Controller runtime files (generated, not source)
+ctrl_index.dat
+
+# Temporary files written by the client/server
+sc_index_tmp.lua
+sc_manifest_tmp.lua
+sc_audio_tmp.dfpwm

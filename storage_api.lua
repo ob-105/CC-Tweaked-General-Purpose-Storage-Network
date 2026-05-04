@@ -1,0 +1,159 @@
+-- CC:Tweaked Storage API
+-- Drop this file on any computer that needs to use the storage network.
+-- The controller computer must be running storage_controller.lua.
+--
+-- USAGE EXAMPLE ──────────────────────────────────────────────────────────────
+--
+--   local store = require("storage_api")
+--
+--   -- Store anything (strings, or tables/numbers auto-serialized)
+--   store.put("players/steve/score", 42)
+--   store.put("config/motd", "Hello world!")
+--
+--   -- Retrieve it back
+--   local score = store.get("players/steve/score")   --> "42"
+--   local motd  = store.get("config/motd")           --> "Hello world!"
+--
+--   -- Check / delete
+--   print(store.exists("config/motd"))   --> true
+--   store.delete("config/motd")
+--
+--   -- List keys (optionally filter by prefix)
+--   local keys = store.list("players/")   --> {"players/steve/score", ...}
+--
+--   -- Network info
+--   local info = store.stats()
+--   print(info.keyCount, info.totalFree, #info.nodes)
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local CTRL_PROTOCOL = "cct-store-ctrl"
+local FIND_TIMEOUT  = 3    -- seconds to search for the controller
+local RPC_TIMEOUT   = 10   -- seconds to wait for a controller response
+
+local M = {}
+local controllerId = nil
+
+-- ── Modem setup ────────────────────────────────────────────────────────────
+local function ensureModem()
+    for _, side in ipairs(peripheral.getNames()) do
+        if peripheral.getType(side) == "modem" then
+            pcall(rednet.open, side)
+            return true
+        end
+    end
+    return false
+end
+
+-- ── Locate the controller on the network ──────────────────────────────────
+local function findController()
+    if not ensureModem() then return false, "No modem attached" end
+    rednet.broadcast({cmd = "ping"}, CTRL_PROTOCOL)
+    local deadline = os.clock() + FIND_TIMEOUT
+    while os.clock() < deadline do
+        local sender, msg = rednet.receive(CTRL_PROTOCOL, deadline - os.clock())
+        if sender and type(msg) == "table" and msg.ok then
+            controllerId = sender
+            return true
+        end
+    end
+    return false, "No storage controller found on the network"
+end
+
+-- ── Send a request and wait for the reply ─────────────────────────────────
+local function rpc(req, timeout)
+    if not controllerId then
+        local ok, err = findController()
+        if not ok then return nil, err end
+    end
+    rednet.send(controllerId, req, CTRL_PROTOCOL)
+    local sender, resp = rednet.receive(CTRL_PROTOCOL, timeout or RPC_TIMEOUT)
+    if sender == controllerId and type(resp) == "table" then
+        return resp
+    end
+    -- Lost the controller - reset so next call rediscovers it
+    controllerId = nil
+    return nil, "No response from controller (did it restart? call store.reconnect())"
+end
+
+-- ── Public API ─────────────────────────────────────────────────────────────
+
+-- store.put(key, data)
+-- Store a value.  key is any non-empty string (slashes make nice namespaces).
+-- data can be a string, number, boolean, or table (auto-serialized).
+-- Returns: true, replicaCount   OR   false, errorMessage
+function M.put(key, data)
+    if type(data) ~= "string" then data = textutils.serialize(data) end
+    local r, err = rpc({cmd="store", key=key, data=data})
+    if not r then return false, err end
+    if r.ok then return true, r.replicas end
+    return false, r.err
+end
+
+-- store.get(key)
+-- Retrieve a stored value as a string, or nil + error on failure.
+-- If you stored a table with put(), deserialize with textutils.unserialize().
+function M.get(key)
+    local r, err = rpc({cmd="retrieve", key=key})
+    if not r then return nil, err end
+    if r.ok then return r.data end
+    return nil, r.err
+end
+
+-- store.delete(key)
+-- Remove a key from all nodes.
+-- Returns: true   OR   false, errorMessage
+function M.delete(key)
+    local r, err = rpc({cmd="delete", key=key})
+    if not r then return false, err end
+    return r.ok
+end
+
+-- store.exists(key)
+-- Returns true/false, or nil + error if the controller is unreachable.
+function M.exists(key)
+    local r, err = rpc({cmd="exists", key=key})
+    if not r then return nil, err end
+    return r.exists
+end
+
+-- store.list([prefix])
+-- Returns a sorted array of all stored keys.
+-- Pass a prefix string to filter (e.g. "players/" returns only player keys).
+function M.list(prefix)
+    local r, err = rpc({cmd="list", prefix=prefix})
+    if not r then return nil, err end
+    return r.keys
+end
+
+-- store.stats()
+-- Returns a table with network information:
+--   .nodes       - array of {id, label, free, cap} per node
+--   .keyCount    - number of keys stored
+--   .totalFree   - total free bytes across all nodes
+--   .totalCap    - total capacity across all nodes
+--   .replication - current replication factor
+function M.stats()
+    local r, err = rpc({cmd="stats"})
+    if not r then return nil, err end
+    return r.stats
+end
+
+-- store.rescan()
+-- Tell the controller to rediscover storage nodes (useful after adding nodes).
+-- Returns: true, nodeCount   OR   false, errorMessage
+function M.rescan()
+    local r, err = rpc({cmd="rescan"}, 15)
+    if not r then return false, err end
+    return r.ok, r.nodeCount
+end
+
+-- store.reconnect()
+-- Forget the cached controller ID and search for it again.
+-- Call this if the controller computer was restarted.
+function M.reconnect()
+    controllerId = nil
+    return findController()
+end
+
+return M
