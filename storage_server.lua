@@ -3,6 +3,34 @@
 -- Set it as startup.lua or run manually: lua storage_server.lua
 -- Each computer provides ~1MB of frame storage.
 
+local VERSION    = "1.1.0"
+local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
+
+-- ── Auto-updater ───────────────────────────────────────────────────────────
+local function autoUpdate()
+    if not http then return end
+    local res = http.get(GITHUB_RAW .. "/versions.lua")
+    if not res then return end
+    local fn = load(res.readAll()); res.close()
+    if not fn then return end
+    local ok, ver = pcall(fn)
+    if not ok or type(ver) ~= "table" then return end
+    if ver.server ~= VERSION then
+        print(("[update] server: %s -> %s  Downloading..."):format(VERSION, ver.server))
+        local dl = http.get(GITHUB_RAW .. "/storage_server.lua")
+        if dl then
+            local path = shell.getRunningProgram()
+            local f = fs.open(path, "w"); f.write(dl.readAll()); f.close(); dl.close()
+            print("[update] Done. Rebooting...")
+            os.sleep(1); os.reboot()
+        else
+            print("[update] Download failed, continuing with current version.")
+        end
+    end
+end
+
+autoUpdate()
+
 local PROTOCOL = "cct-media-store"
 
 -- Open every modem we can find

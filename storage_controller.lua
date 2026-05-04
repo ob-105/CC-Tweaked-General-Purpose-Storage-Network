@@ -12,6 +12,34 @@
 --                       │  node 1 │       │  node 2 │   ...    │  node N │
 --                       └─────────┘       └─────────┘          └─────────┘
 --
+local VERSION    = "1.1.0"
+local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
+
+-- ── Auto-updater ───────────────────────────────────────────────────────────
+local function autoUpdate()
+    if not http then return end
+    local res = http.get(GITHUB_RAW .. "/versions.lua")
+    if not res then return end
+    local fn = load(res.readAll()); res.close()
+    if not fn then return end
+    local ok, ver = pcall(fn)
+    if not ok or type(ver) ~= "table" then return end
+    if ver.controller ~= VERSION then
+        print(("[update] controller: %s -> %s  Downloading..."):format(VERSION, ver.controller))
+        local dl = http.get(GITHUB_RAW .. "/storage_controller.lua")
+        if dl then
+            local path = shell.getRunningProgram()
+            local f = fs.open(path, "w"); f.write(dl.readAll()); f.close(); dl.close()
+            print("[update] Done. Rebooting...")
+            os.sleep(1); os.reboot()
+        else
+            print("[update] Download failed, continuing with current version.")
+        end
+    end
+end
+
+autoUpdate()
+
 -- CONFIG ──────────────────────────────────────────────────────────────────
 local REPLICATION   = 2    -- how many nodes to write each key to
 local RESCAN_EVERY  = 60   -- seconds between automatic node rescans

@@ -1,76 +1,25 @@
--- CC:Tweaked Storage Client
--- Standalone tool to pre-load videos onto storage node computers and play
--- them back at full speed without downloading from GitHub during playback.
+-- CC:Tweaked Media Storage Client
+-- Pre-load videos from GitHub onto the storage network, then play them
+-- back at full speed without downloading during playback.
 --
--- Setup:
---   1. Connect storage node computers via Wired Modem + Networking Cable
---   2. Run  storage_server.lua  on each node (set as startup)
---   3. Run  lua storage_client.lua  on the player computer
+-- PREREQUISITES
+--   1. storage_server.lua      running on each node computer
+--   2. storage_controller.lua  running on one controller computer
+--   3. storage_api.lua         copied to THIS computer (same folder)
 --
--- The more nodes you attach, the more storage you have (1MB per computer).
+-- USAGE: lua storage_client.lua
+
+local store = require("storage_api")
 
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-tweaked-Audio-video-playback./main"
-local PROTOCOL   = "cct-media-store"
-local TIMEOUT    = 3  -- seconds to wait for node responses
 
--- ── Modem setup ────────────────────────────────────────────────────────────
-local function openModems()
-    local opened = 0
-    for _, side in ipairs(peripheral.getNames()) do
-        if peripheral.getType(side) == "modem" then
-            pcall(rednet.open, side)
-            opened = opened + 1
-        end
-    end
-    return opened
-end
-
--- ── Node discovery ─────────────────────────────────────────────────────────
-local function discoverNodes()
-    rednet.broadcast({cmd="ping"}, PROTOCOL)
-    local nodes = {}
-    local deadline = os.clock() + TIMEOUT
-    while os.clock() < deadline do
-        local sender, msg = rednet.receive(PROTOCOL, deadline - os.clock())
-        if sender and type(msg) == "table" and msg.ok then
-            nodes[#nodes+1] = {
-                id    = sender,
-                label = msg.label or ("node-"..sender),
-                free  = msg.free  or 0,
-                cap   = msg.cap   or 0,
-            }
-        end
-    end
-    return nodes
-end
-
--- ── RPC helpers ────────────────────────────────────────────────────────────
-local function rpc(nodeId, req, timeout)
-    timeout = timeout or TIMEOUT
-    rednet.send(nodeId, req, PROTOCOL)
-    local sender, resp = rednet.receive(PROTOCOL, timeout)
-    if sender == nodeId and type(resp) == "table" then return resp end
-    return nil
-end
-
-local function wipeNodes(nodes)
-    print("Wiping all nodes...")
-    for _, n in ipairs(nodes) do
-        local r = rpc(n.id, {cmd="wipe"})
-        if r then
-            print(("  %s: freed %dKB"):format(n.label, math.floor((r.free or 0)/1024)))
-        end
-    end
-end
-
--- ── Index loading ──────────────────────────────────────────────────────────
+-- ── Index / manifest loading ────────────────────────────────────────────────
 local function loadIndex()
     local res = http.get(GITHUB_RAW.."/output/index.lua")
     if not res then error("Could not fetch index from GitHub") end
     local data = res.readAll(); res.close()
-    local f = fs.open("sc_index_tmp.lua", "w"); f.write(data); f.close()
-    local fn = loadfile("sc_index_tmp.lua")
-    fs.delete("sc_index_tmp.lua")
+    local f = fs.open("sc_tmp.lua", "w"); f.write(data); f.close()
+    local fn = loadfile("sc_tmp.lua"); fs.delete("sc_tmp.lua")
     if not fn then error("Could not parse index") end
     local ok, r = pcall(fn)
     if not ok or type(r) ~= "table" then return {video={}, audio={}} end
@@ -79,73 +28,62 @@ local function loadIndex()
 end
 
 local function loadManifest(name)
-    local url = GITHUB_RAW.."/output/"..name.."/manifest.lua"
-    local res = http.get(url)
+    local res = http.get(GITHUB_RAW.."/output/"..name.."/manifest.lua")
     if not res then error("Could not fetch manifest for "..name) end
     local data = res.readAll(); res.close()
-    local f = fs.open("sc_manifest_tmp.lua", "w"); f.write(data); f.close()
-    local fn = loadfile("sc_manifest_tmp.lua")
-    fs.delete("sc_manifest_tmp.lua")
+    local f = fs.open("sc_tmp.lua", "w"); f.write(data); f.close()
+    local fn = loadfile("sc_tmp.lua"); fs.delete("sc_tmp.lua")
     if not fn then error("Bad manifest") end
     return fn()
 end
 
--- ── Distribute a file to the least-full node ───────────────────────────────
-local function putFile(nodes, path, data)
-    -- pick node with most free space
-    table.sort(nodes, function(a,b) return a.free > b.free end)
-    for _, n in ipairs(nodes) do
-        if n.free > #data + 2048 then
-            local r = rpc(n.id, {cmd="put", path=path, data=data}, 5)
-            if r and r.ok then
-                n.free = r.free or n.free
-                return n.label
-            end
-        end
-    end
-    return nil  -- no space
-end
+-- ── Pre-load a video onto the storage network ───────────────────────────────
+local function loadVideo(name, manifest)
+    local count = manifest.frame_count or 0
+    local fext  = manifest.frame_ext or "nfp"
+    local audio = manifest.has_audio == "true"
+    print("[loader] Pre-loading "..name.."  frames="..count.."  ext="..fext)
 
--- ── Pre-load a video onto the storage network ──────────────────────────────
-local function loadVideo(name, manifest, nodes)
-    local count  = manifest.frame_count or 0
-    local fext   = manifest.frame_ext or "nfp"
-    local audio  = manifest.has_audio == "true"
-    print(("[loader] Pre-loading '%s'  frames=%d  ext=%s"):format(name, count, fext))
-
-    -- Audio
     if audio then
         io.write("  Downloading audio... ")
         local res = http.get(GITHUB_RAW.."/output/"..name.."/audio.dfpwm", nil, true)
         if res then
             local data = res.readAll(); res.close()
-            local node = putFile(nodes, name.."/audio.dfpwm", data)
-            if node then print("stored on "..node)
-            else print("FAILED (no space)") end
+            local ok, err = store.put(name.."/audio.dfpwm", data)
+            if ok then print("stored") else print("FAILED: "..tostring(err)) end
         else print("FAILED (download)") end
     end
 
-    -- Frames
-    local stored = 0; local skipped = 0
+    local stored = 0; local failed = 0
     for i = 1, count do
-        local fname = ("%06d.%s"):format(i, fext)
-        local url   = GITHUB_RAW.."/output/"..name.."/frames/"..fname
-        local res   = http.get(url)
+        local fname = string.format("%06d.%s", i, fext)
+        local key   = name.."/frames/"..fname
+        local res   = http.get(GITHUB_RAW.."/output/"..name.."/frames/"..fname)
         if res then
             local data = res.readAll(); res.close()
-            local node = putFile(nodes, name.."/frames/"..fname, data)
-            if node then stored = stored + 1
-            else skipped = skipped + 1; break end
-        else skipped = skipped + 1 end
+            local ok, err = store.put(key, data)
+            if ok then stored = stored + 1
+            else failed = failed + 1; print("\n  FAILED frame "..i..": "..tostring(err)); break end
+        else failed = failed + 1 end
         if i % 20 == 0 or i == count then
-            io.write(("\r  Frames: %d/%d stored, %d skipped  "):format(stored, count, skipped))
+            io.write("\r  Frames: "..stored.."/"..count.." stored, "..failed.." failed  ")
         end
     end
-    print(("\n  Done. Stored %d/%d frames across %d node(s)."):format(stored, count, #nodes))
+    print("\n  Done. "..stored.."/"..count.." frames stored.")
     return stored
 end
 
--- ── Playback from storage network ──────────────────────────────────────────
+-- ── Delete all stored keys for a video ─────────────────────────────────────
+local function wipeVideo(name)
+    print("Wiping "..name.." from storage network...")
+    local keys, err = store.list(name.."/")
+    if not keys then print("Error: "..tostring(err)); return end
+    local n = 0
+    for _, k in ipairs(keys) do store.delete(k); n = n + 1 end
+    print("  Deleted "..n.." key(s).")
+end
+
+-- ── Playback from storage network ───────────────────────────────────────────
 local BLIT = "0123456789abcdef"
 local function renderLines(mon, lines)
     local nh = #lines; if nh == 0 then return end
@@ -182,33 +120,20 @@ local function decodeNFPC(data)
     return lines
 end
 
-local function getFrame(nodes, name, fext, i)
-    local path = name.."/frames/"..("%06d.%s"):format(i, fext)
-    for _, n in ipairs(nodes) do
-        local r = rpc(n.id, {cmd="get", path=path}, 2)
-        if r and r.ok and r.data then return r.data end
-    end
-    return nil
-end
-
-local function playFromNetwork(name, manifest, nodes)
-    local fps    = manifest.fps or 5
-    local count  = manifest.frame_count or 0
-    local fext   = manifest.frame_ext or "nfp"
-    local audio  = manifest.has_audio == "true"
-    local mon    = peripheral.find("monitor")
+local function playFromNetwork(name, manifest)
+    local fps   = manifest.fps or 5
+    local count = manifest.frame_count or 0
+    local fext  = manifest.frame_ext or "nfp"
+    local audio = manifest.has_audio == "true"
+    local mon   = peripheral.find("monitor")
     if mon then mon.setTextScale(0.5) end
     local speakers = {peripheral.find("speaker")}
-    print(("[player] monitor=%s  speakers=%d"):format(tostring(mon~=nil), #speakers))
+    print("[player] monitor="..tostring(mon~=nil).."  speakers="..#speakers)
 
     local function audioLoop()
         if not audio or #speakers == 0 then return end
-        local data = nil
-        for _, n in ipairs(nodes) do
-            local r = rpc(n.id, {cmd="get", path=name.."/audio.dfpwm"}, 5)
-            if r and r.ok and r.data then data = r.data; break end
-        end
-        if not data then print("[player] Audio not found on network."); return end
+        local data, err = store.get(name.."/audio.dfpwm")
+        if not data then print("[player] Audio not on network: "..tostring(err)); return end
         local tmp = "sc_audio_tmp.dfpwm"
         local f = fs.open(tmp, "wb"); f.write(data); f.close()
         local dfpwm = require("cc.audio.dfpwm")
@@ -235,7 +160,8 @@ local function playFromNetwork(name, manifest, nodes)
         for frame = 1, count do
             local due     = (frame - 1) / fps
             local elapsed = os.clock() - t0
-            local data    = getFrame(nodes, name, fext, frame)
+            local key     = name.."/frames/"..string.format("%06d.%s", frame, fext)
+            local data    = store.get(key)
             if elapsed <= due + (1/fps) then
                 local wait = due - elapsed
                 if wait > 0 then os.sleep(wait) end
@@ -247,29 +173,25 @@ local function playFromNetwork(name, manifest, nodes)
                 skipped = skipped + 1
             end
         end
-        if skipped > 0 then print(("[player] Skipped %d frame(s)."):format(skipped)) end
+        if skipped > 0 then print("[player] Skipped "..skipped.." frame(s).") end
     end
 
-    print(("[player] Playing '%s' from storage network..."):format(name))
+    print("[player] Playing "..name.." from storage network...")
     if audio and count > 0 then parallel.waitForAll(audioLoop, videoLoop)
     elseif audio then audioLoop()
     elseif count > 0 then videoLoop() end
     print("\n[player] Done. Press Enter..."); io.read()
 end
 
--- ── Menus ───────────────────────────────────────────────────────────────────
+-- ── Menus ────────────────────────────────────────────────────────────────────
 local function drawMenu(title, items)
     term.clear(); term.setCursorPos(1,1)
     print("===========================")
-    print("  Storage Client | "..title)
+    print("  Media Storage | "..title)
     print("===========================")
     if #items == 0 then print("  (none)") end
     for i, item in ipairs(items) do
-        if type(item) == "table" then
-            print(("  %d. %s  [free: %dKB]"):format(i, item.label, math.floor(item.free/1024)))
-        else
-            print(("  %d. %s"):format(i, item))
-        end
+        print("  "..i..". "..tostring(item))
     end
     print("---------------------------"); print("  0. Back"); print()
     io.write("Select: ")
@@ -278,33 +200,33 @@ local function drawMenu(title, items)
     return items[n]
 end
 
--- ── Main ───────────────────────────────────────────────────────────────────
+-- ── Main ─────────────────────────────────────────────────────────────────────
 local function main()
     term.clear(); term.setCursorPos(1,1)
-    print("=== CC:T Storage Client ==="); print()
-    if openModems() == 0 then print("No modem found! Attach a wired modem."); return end
+    print("=== CC:T Media Storage Client ==="); print()
 
-    print("Discovering storage nodes...")
-    local nodes = discoverNodes()
-    if #nodes == 0 then
-        print("No storage nodes found.")
-        print("Make sure storage_server.lua is running on connected computers.")
+    local info, err = store.stats()
+    if not info then
+        print("Could not reach storage controller: "..tostring(err))
+        print("Make sure storage_controller.lua is running.")
         return
     end
-    local totalFree = 0
-    for _, n in ipairs(nodes) do totalFree = totalFree + n.free end
-    print(("Found %d node(s), %dKB total free."):format(#nodes, math.floor(totalFree/1024)))
+    print("Network: "..#info.nodes.." node(s)  |  Free: "..math.floor(info.totalFree/1024).."KB / "..math.floor(info.totalCap/1024).."KB")
     print()
 
     while true do
         term.clear(); term.setCursorPos(1,1)
-        print("=== Storage Client ===")
-        print(("  Nodes: %d  |  Free: %dKB"):format(#nodes, math.floor(totalFree/1024)))
-        print("======================")
+        local info2  = store.stats()
+        local freeKB = info2 and math.floor(info2.totalFree/1024) or "?"
+        local kcount = info2 and info2.keyCount or "?"
+        print("=== Media Storage Client ===")
+        print("  Free: "..tostring(freeKB).."KB  |  Keys: "..tostring(kcount))
+        print("============================")
         print("  1. Pre-load video onto network")
         print("  2. Play video from network")
-        print("  3. Wipe all nodes")
-        print("  4. Rescan nodes")
+        print("  3. Wipe a video from network")
+        print("  4. Wipe ALL data from network")
+        print("  5. Network stats")
         print("  Q. Quit"); print()
         io.write("Choice: ")
         local inp = (io.read() or ""):lower()
@@ -316,15 +238,12 @@ local function main()
             local ok, idx = pcall(loadIndex)
             if not ok then print("Error: "..tostring(idx)); io.read(); goto continue end
             if #idx.video == 0 then print("No videos in index."); os.sleep(1); goto continue end
-            local pick = drawMenu("Choose video to load", idx.video)
+            local pick = drawMenu("Choose video to pre-load", idx.video)
             if pick then
                 local ok2, manifest = pcall(loadManifest, pick)
                 if not ok2 then print("Error: "..tostring(manifest)); io.read()
-                else
-                    loadVideo(pick, manifest, nodes)
-                    totalFree = 0
-                    for _, n in ipairs(nodes) do totalFree = totalFree + n.free end
-                end
+                else loadVideo(pick, manifest) end
+                io.read()
             end
 
         elseif inp == "2" then
@@ -336,24 +255,44 @@ local function main()
             if pick then
                 local ok2, manifest = pcall(loadManifest, pick)
                 if not ok2 then print("Error: "..tostring(manifest)); io.read()
-                else playFromNetwork(pick, manifest, nodes) end
+                else playFromNetwork(pick, manifest) end
             end
 
         elseif inp == "3" then
-            io.write("Wipe ALL stored data? (y/n): ")
-            if (io.read() or ""):lower() == "y" then
-                wipeNodes(nodes)
-                totalFree = 0
-                for _, n in ipairs(nodes) do totalFree = totalFree + n.free end
-            end
+            print("Fetching index from GitHub...")
+            local ok, idx = pcall(loadIndex)
+            if not ok then print("Error: "..tostring(idx)); io.read(); goto continue end
+            if #idx.video == 0 then print("No videos."); os.sleep(1); goto continue end
+            local pick = drawMenu("Choose video to wipe", idx.video)
+            if pick then wipeVideo(pick); io.read() end
 
         elseif inp == "4" then
-            print("Rescanning...")
-            nodes = discoverNodes()
-            totalFree = 0
-            for _, n in ipairs(nodes) do totalFree = totalFree + n.free end
-            print(("Found %d node(s), %dKB free."):format(#nodes, math.floor(totalFree/1024)))
-            os.sleep(1)
+            io.write("Wipe ALL stored data from the network? (y/n): ")
+            if (io.read() or ""):lower() == "y" then
+                print("Listing all keys...")
+                local ks, e2 = store.list()
+                if not ks then print("Error: "..tostring(e2))
+                else
+                    local n = 0
+                    for _, k in ipairs(ks) do store.delete(k); n = n + 1 end
+                    print("Deleted "..n.." key(s).")
+                end
+                io.read()
+            end
+
+        elseif inp == "5" then
+            local si, se = store.stats()
+            if not si then print("Error: "..tostring(se))
+            else
+                print("Keys:        "..si.keyCount)
+                print("Free:        "..math.floor(si.totalFree/1024).."KB / "..math.floor(si.totalCap/1024).."KB")
+                print("Replication: "..si.replication.."x")
+                print("Nodes ("..#si.nodes.."):")
+                for _, nd in ipairs(si.nodes) do
+                    print("  "..nd.label.."  free="..math.floor(nd.free/1024).."KB")
+                end
+            end
+            io.read()
         end
         ::continue::
     end
