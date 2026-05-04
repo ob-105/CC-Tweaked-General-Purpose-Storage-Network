@@ -18,6 +18,20 @@ local RESCAN_EVERY  = 60   -- seconds between automatic node rescans
 local NODE_TIMEOUT  = 5    -- seconds to wait for a node RPC response
 -- ─────────────────────────────────────────────────────────────────────────
 
+-- ── Screen layout ──────────────────────────────────────────────────────────
+-- Lines 1 .. H-4  : scrolling activity log
+-- Line  H-3       : divider
+-- Line  H-2       : live stats bar
+-- Line  H-1       : key hint bar
+-- Line  H         : (reserved / cursor)
+local W, H   = term.getSize()
+local LOG_H  = H - 4        -- usable log rows
+local inMenu = false        -- true while a menu is open (pauses log redraws)
+
+-- Colour helpers (safe on non-advanced computers)
+local function colour(c) if term.isColour() then term.setTextColour(c) end end
+local function resetColour() colour(colours.white) end
+
 local NODE_PROTOCOL = "cct-media-store"   -- controller <-> storage nodes
 local CTRL_PROTOCOL = "cct-store-ctrl"    -- clients    <-> controller
 local INDEX_FILE    = "ctrl_index.dat"    -- persisted key->node index
@@ -26,6 +40,60 @@ local INDEX_FILE    = "ctrl_index.dat"    -- persisted key->node index
 local nodes    = {}   -- [id] -> {id, label, free, cap}
 local index    = {}   -- [key] -> {nodeId, nodeId, ...}
 local lastScan = -999
+
+-- ── Activity log ───────────────────────────────────────────────────────────
+local logBuf = {}   -- ring buffer of strings
+
+local function drawLog()
+    if inMenu then return end
+    local start = math.max(1, #logBuf - LOG_H + 1)
+    for row = 1, LOG_H do
+        local line = logBuf[start + row - 1] or ""
+        term.setCursorPos(1, row)
+        term.clearLine()
+        term.write(line:sub(1, W))
+    end
+end
+
+local function drawDivider()
+    if inMenu then return end
+    term.setCursorPos(1, H - 3)
+    colour(colours.grey)
+    term.write(string.rep("-", W))
+    resetColour()
+end
+
+local function drawStats()
+    if inMenu then return end
+    local nodeCount, totalFree = 0, 0
+    for _, n in pairs(nodes) do nodeCount = nodeCount + 1; totalFree = totalFree + n.free end
+    local keyCount = 0; for _ in pairs(index) do keyCount = keyCount + 1 end
+    term.setCursorPos(1, H - 2); term.clearLine()
+    colour(colours.cyan)
+    term.write(("Nodes: %d  |  Keys: %d  |  Free: %dKB  |  Rep: %dx")
+        :format(nodeCount, keyCount, math.floor(totalFree / 1024), REPLICATION))
+    resetColour()
+end
+
+local function drawHints()
+    if inMenu then return end
+    term.setCursorPos(1, H - 1); term.clearLine()
+    colour(colours.yellow)
+    term.write("[M] Menu  [R] Rescan  [Q] Quit")
+    resetColour()
+    term.setCursorPos(1, H); term.clearLine()
+end
+
+local function redraw()
+    drawLog(); drawDivider(); drawStats(); drawHints()
+end
+
+local function log(msg)
+    local ts = ("[%s] "):format(textutils.formatTime(os.time(), true))
+    logBuf[#logBuf + 1] = ts .. msg
+    if #logBuf > 200 then table.remove(logBuf, 1) end
+    drawLog(); drawDivider(); drawStats(); drawHints()
+end
 
 -- ── Multi-protocol message buffer ──────────────────────────────────────────
 -- CC:Tweaked's rednet.receive discards messages from protocols it isn't
@@ -47,16 +115,15 @@ local function queuedReceive(protocol, timeout)
         local ev, a, b, c = os.pullEvent()
         if ev == "rednet_message" then
             if c == protocol then
-                return a, b          -- matched
+                return a, b
             else
                 msgQueue[#msgQueue+1] = {sender=a, msg=b, proto=c}
             end
         elseif ev == "timer" and a == timerId then
-            return nil, nil          -- timed out
+            return nil, nil
         end
     end
 end
-
 -- ── Modem setup ────────────────────────────────────────────────────────────
 local function openModems()
     local n = 0
@@ -86,7 +153,7 @@ end
 
 -- ── Node discovery ─────────────────────────────────────────────────────────
 local function scanNodes()
-    print("[ctrl] Scanning for storage nodes...")
+    log("Scanning for storage nodes...")
     rednet.broadcast({cmd = "ping"}, NODE_PROTOCOL)
     local found    = {}
     local timerId  = os.startTimer(3)
@@ -96,7 +163,6 @@ local function scanNodes()
             if c == NODE_PROTOCOL and type(b) == "table" and b.ok then
                 found[a] = {id=a, label=b.label or ("node-"..a), free=b.free or 0, cap=b.cap or 0}
             elseif c ~= NODE_PROTOCOL then
-                -- buffer messages for other protocols (e.g. client requests arriving during scan)
                 msgQueue[#msgQueue+1] = {sender=a, msg=b, proto=c}
             end
         elseif ev == "timer" and a == timerId then
@@ -106,7 +172,7 @@ local function scanNodes()
     nodes = found
     local count, totalFree = 0, 0
     for _, n in pairs(nodes) do count = count + 1; totalFree = totalFree + n.free end
-    print(("[ctrl] %d node(s) online | %dKB total free"):format(count, math.floor(totalFree / 1024)))
+    log(("Scan complete: %d node(s) online | %dKB total free"):format(count, math.floor(totalFree / 1024)))
     lastScan = os.clock()
 end
 
@@ -158,6 +224,7 @@ local function opStore(key, data)
     if #written == 0 then return false, "No node had enough free space" end
     index[key] = written
     saveIndex()
+    log(("STORE '%s' → %d replica(s) | %dB"):format(key, #written, #data))
     return true, #written
 end
 
@@ -175,7 +242,7 @@ end
 
 local function opDelete(key)
     local nodeIds = index[key]
-    if not nodeIds then return true end     -- already gone
+    if not nodeIds then return true end
     for _, nid in ipairs(nodeIds) do
         if nodes[nid] then
             local r = nodeRPC(nid, {cmd="delete", path=key})
@@ -184,6 +251,7 @@ local function opDelete(key)
     end
     index[key] = nil
     saveIndex()
+    log(("DELETE '%s'"):format(key))
     return true
 end
 
@@ -239,6 +307,7 @@ local function handleClient(sender, msg)
         else      rednet.send(sender, {ok=false, err=info},      CTRL_PROTOCOL) end
 
     elseif cmd == "retrieve" then
+        log(("GET '%s' from #%d"):format(msg.key or "?", sender))
         local data, err = opRetrieve(msg.key)
         if data ~= nil then rednet.send(sender, {ok=true, data=data},  CTRL_PROTOCOL)
         else                rednet.send(sender, {ok=false, err=err},   CTRL_PROTOCOL) end
@@ -263,6 +332,231 @@ local function handleClient(sender, msg)
     end
 end
 
+-- ── Management console helpers ─────────────────────────────────────────────
+local function menuHeader(title)
+    term.clear(); term.setCursorPos(1, 1)
+    colour(colours.orange)
+    print("=== Storage Controller | " .. title .. " ===")
+    resetColour()
+end
+
+local function pause(msg)
+    colour(colours.grey)
+    print(msg or "\nPress Enter to continue...")
+    resetColour()
+    io.read()
+end
+
+-- Show per-node status table
+local function menuStatus()
+    menuHeader("Node Status")
+    local nodeList = {}
+    for _, n in pairs(nodes) do nodeList[#nodeList+1] = n end
+    table.sort(nodeList, function(a, b) return a.id < b.id end)
+
+    if #nodeList == 0 then
+        colour(colours.red); print("No nodes online."); resetColour()
+    else
+        print(("%-20s %5s %8s %8s %6s"):format("Label", "ID", "Free KB", "Cap KB", "Used%"))
+        print(string.rep("-", W))
+        for _, n in ipairs(nodeList) do
+            local pct = n.cap > 0 and math.floor((1 - n.free / n.cap) * 100) or 0
+            colour(pct >= 90 and colours.red or pct >= 70 and colours.yellow or colours.lime)
+            print(("%-20s %5d %8d %8d %5d%%"):format(
+                n.label:sub(1, 20), n.id,
+                math.floor(n.free / 1024), math.floor(n.cap / 1024), pct))
+            resetColour()
+        end
+    end
+    local keyCount = 0; for _ in pairs(index) do keyCount = keyCount + 1 end
+    print(string.rep("-", W))
+    print(("Total nodes: %d  |  Keys stored: %d  |  Replication: %dx")
+        :format(#nodeList, keyCount, REPLICATION))
+    pause()
+end
+
+-- Browse stored keys with optional prefix filter
+local function menuBrowse()
+    menuHeader("Browse Keys")
+    io.write("Filter prefix (Enter for all): "); local prefix = io.read()
+    if prefix == "" then prefix = nil end
+    local keys = opList(prefix)
+    print(string.rep("-", W))
+    if #keys == 0 then
+        colour(colours.yellow); print("No keys found."); resetColour()
+    else
+        for i, k in ipairs(keys) do
+            local replicas = index[k] and #index[k] or 0
+            colour(replicas < REPLICATION and colours.yellow or colours.white)
+            print(("  %d. %s  [%drep]"):format(i, k, replicas))
+            resetColour()
+            if i % (H - 6) == 0 and i < #keys then
+                io.write("-- more -- (Enter) "); io.read()
+            end
+        end
+        print(string.rep("-", W))
+        print(#keys .. " key(s)")
+    end
+    pause()
+end
+
+-- Delete a single key by name
+local function menuDeleteKey()
+    menuHeader("Delete Key")
+    io.write("Key to delete (exact): "); local key = io.read()
+    if key == "" then return end
+    if not index[key] then
+        colour(colours.red); print("Key not found: " .. key); resetColour()
+    else
+        io.write("Delete '" .. key .. "'? (y/n): ")
+        if (io.read() or ""):lower() == "y" then
+            opDelete(key)
+            colour(colours.lime); print("Deleted."); resetColour()
+        end
+    end
+    pause()
+end
+
+-- Wipe a single node (removes all files from it) and repair index
+local function menuWipeNode()
+    menuHeader("Wipe Node")
+    local nodeList = {}
+    for _, n in pairs(nodes) do nodeList[#nodeList+1] = n end
+    table.sort(nodeList, function(a, b) return a.id < b.id end)
+    if #nodeList == 0 then
+        colour(colours.red); print("No nodes online."); resetColour()
+        pause(); return
+    end
+    for i, n in ipairs(nodeList) do
+        print(("  %d. [#%d] %s  (%dKB free)"):format(i, n.id, n.label, math.floor(n.free/1024)))
+    end
+    print("  0. Cancel"); io.write("Select node: ")
+    local sel = tonumber(io.read())
+    if not sel or sel == 0 or not nodeList[sel] then return end
+    local n = nodeList[sel]
+    io.write(("Wipe ALL data on '%s' (#%d)? This cannot be undone. (y/n): "):format(n.label, n.id))
+    if (io.read() or ""):lower() ~= "y" then return end
+
+    local r = nodeRPC(n.id, {cmd="wipe"})
+    if r and r.ok then
+        nodes[n.id].free = r.free or nodes[n.id].free
+        -- Remove all index entries that were ONLY on this node; downgrade others
+        local removed = 0
+        for k, reps in pairs(index) do
+            local newReps = {}
+            for _, rid in ipairs(reps) do if rid ~= n.id then newReps[#newReps+1] = rid end end
+            if #newReps == 0 then index[k] = nil; removed = removed + 1
+            else index[k] = newReps end
+        end
+        saveIndex()
+        log(("WIPE node '%s' | %d key(s) removed from index"):format(n.label, removed))
+        colour(colours.lime); print("Node wiped. " .. removed .. " index entries removed."); resetColour()
+    else
+        colour(colours.red); print("Wipe failed or node did not respond."); resetColour()
+    end
+    pause()
+end
+
+-- Wipe every node and clear the entire index
+local function menuWipeAll()
+    menuHeader("!! WIPE ALL STORAGE !!")
+    colour(colours.red)
+    print("This will permanently erase ALL data on ALL nodes")
+    print("and clear the index. This CANNOT be undone.")
+    resetColour()
+    io.write("\nType WIPE to confirm, or Enter to cancel: ")
+    if io.read() ~= "WIPE" then
+        print("Cancelled."); pause(); return
+    end
+    local wiped = 0
+    for _, n in pairs(nodes) do
+        local r = nodeRPC(n.id, {cmd="wipe"})
+        if r and r.ok then
+            nodes[n.id].free = r.free or nodes[n.id].free
+            wiped = wiped + 1
+            colour(colours.lime)
+            print(("  Wiped: %s (#%d)"):format(n.label, n.id))
+            resetColour()
+        else
+            colour(colours.red)
+            print(("  FAILED: %s (#%d)"):format(n.label, n.id))
+            resetColour()
+        end
+    end
+    index = {}
+    saveIndex()
+    log(("WIPE ALL — %d node(s) wiped, index cleared"):format(wiped))
+    colour(colours.lime); print("\nDone. " .. wiped .. " node(s) wiped."); resetColour()
+    pause()
+end
+
+-- Top-level management menu
+local function managementMenu()
+    inMenu = true
+    while true do
+        menuHeader("Main Menu")
+        print("  1. Node status & health")
+        print("  2. Browse stored keys")
+        print("  3. Delete a key")
+        print("  4. Rescan nodes")
+        print("  5. Wipe a single node")
+        print("  6. WIPE ALL storage")
+        print("  0. Back to monitor")
+        print()
+        io.write("Choice: ")
+        local c = io.read() or ""
+
+        if     c == "1" then menuStatus()
+        elseif c == "2" then menuBrowse()
+        elseif c == "3" then menuDeleteKey()
+        elseif c == "4" then
+            inMenu = false; scanNodes(); inMenu = true
+            menuHeader("Rescan")
+            local count = 0; for _ in pairs(nodes) do count = count + 1 end
+            colour(colours.lime); print(count .. " node(s) found."); resetColour()
+            pause()
+        elseif c == "5" then menuWipeNode()
+        elseif c == "6" then menuWipeAll()
+        elseif c == "0" or c == "" then break
+        end
+    end
+    inMenu = false
+    term.clear()
+    redraw()
+end
+
+-- ── Network loop (runs as a parallel coroutine) ────────────────────────────
+local function networkLoop()
+    while true do
+        if os.clock() - lastScan >= RESCAN_EVERY then scanNodes() end
+        local sender, msg = queuedReceive(CTRL_PROTOCOL, 1)
+        if sender and type(msg) == "table" then
+            local ok, err = pcall(handleClient, sender, msg)
+            if not ok then
+                log("ERR from #" .. sender .. ": " .. tostring(err))
+                pcall(rednet.send, sender, {ok=false, err="Internal controller error"}, CTRL_PROTOCOL)
+            end
+        end
+    end
+end
+
+-- ── Console loop (runs as a parallel coroutine) ───────────────────────────
+local function consoleLoop()
+    while true do
+        -- Read a single keypress without blocking the network coroutine
+        local _, key = os.pullEvent("key")
+        if key == keys.m then
+            managementMenu()
+        elseif key == keys.r then
+            scanNodes()
+        elseif key == keys.q then
+            term.clear(); term.setCursorPos(1, 1)
+            print("Controller shutting down.")
+            os.shutdown()
+        end
+    end
+end
+
 -- ── Startup ────────────────────────────────────────────────────────────────
 if openModems() == 0 then
     error("No modem found! Attach a wired modem and connect cables to your storage nodes.")
@@ -272,29 +566,13 @@ loadIndex()
 local keyCount = 0; for _ in pairs(index) do keyCount = keyCount + 1 end
 
 term.clear(); term.setCursorPos(1, 1)
-print("=== CC:T Storage Controller ===")
-print("ID:          " .. os.getComputerID())
-print("Label:       " .. (os.getComputerLabel() or "(none)"))
-print("Replication: " .. REPLICATION .. "x")
-print("Index:       " .. keyCount .. " key(s) loaded from disk")
-print("================================")
+-- Initial boot message goes straight into the log buffer before redraw
+logBuf[#logBuf+1] = "Controller starting | ID: " .. os.getComputerID()
+    .. " | Label: " .. (os.getComputerLabel() or "(none)")
+logBuf[#logBuf+1] = "Replication: " .. REPLICATION .. "x | Index: " .. keyCount .. " key(s) loaded"
 
+redraw()
 scanNodes()
-print("Ready. Listening on protocol: " .. CTRL_PROTOCOL)
 
--- ── Main loop ──────────────────────────────────────────────────────────────
-while true do
-    if os.clock() - lastScan >= RESCAN_EVERY then
-        scanNodes()
-    end
-
-    -- Wait up to 1 second for a client request, then loop (to check rescan timer)
-    local sender, msg = queuedReceive(CTRL_PROTOCOL, 1)
-    if sender and type(msg) == "table" then
-        local ok, err = pcall(handleClient, sender, msg)
-        if not ok then
-            print("[ctrl] Error handling request from " .. sender .. ": " .. tostring(err))
-            pcall(rednet.send, sender, {ok=false, err="Internal controller error"}, CTRL_PROTOCOL)
-        end
-    end
-end
+-- Run the network listener and the keyboard console side by side
+parallel.waitForAny(networkLoop, consoleLoop)
