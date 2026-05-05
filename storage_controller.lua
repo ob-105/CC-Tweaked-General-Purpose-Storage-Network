@@ -12,7 +12,7 @@
 --                       │  node 1 │       │  node 2 │   ...    │  node N │
 --                       └─────────┘       └─────────┘          └─────────┘
 --
-local VERSION    = "1.2.0"
+local VERSION    = "1.3.0"
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
 
 -- ── Auto-updater ───────────────────────────────────────────────────────────
@@ -267,16 +267,116 @@ local function pickNodes(count)
     return out
 end
 
+-- ── LZ77 Compression ──────────────────────────────────────────────────────
+-- Transparent compression: data is compressed before writing to nodes and
+-- decompressed on retrieval. A magic header detects compressed payloads so
+-- old uncompressed data continues to work without any migration step.
+--
+-- Format of a compressed block:
+--   MAGIC (3 bytes) | LZ tokens...
+-- Each LZ token is either:
+--   flag < 0x80  → literal run:  (flag+1) literal bytes follow
+--   flag >= 0x80 → back-ref:     length = (flag-0x80)+3, dist = next_byte+1
+
+local COMPRESS_MAGIC = "\27LZ"
+local LZ_MIN   = 3
+local LZ_MAX   = 130   -- 7 low bits of flag + LZ_MIN
+local LZ_WIN   = 256   -- 8-bit offset field
+
+local function lzCompress(input)
+    local n = #input
+    local pos = 1
+    local lits = {}
+    local out  = {}
+
+    local function flushLits()
+        if #lits == 0 then return end
+        local i = 1
+        while i <= #lits do
+            local cnt = math.min(128, #lits - i + 1)
+            out[#out+1] = string.char(cnt - 1)
+            for j = i, i + cnt - 1 do out[#out+1] = lits[j] end
+            i = i + cnt
+        end
+        lits = {}
+    end
+
+    while pos <= n do
+        local wstart = math.max(1, pos - LZ_WIN)
+        local bdist, blen = 0, 0
+        for i = wstart, pos - 1 do
+            local len = 0
+            while len < LZ_MAX and pos + len <= n
+                  and input:byte(i + len) == input:byte(pos + len) do
+                len = len + 1
+            end
+            if len > blen then blen = len; bdist = pos - i end
+        end
+
+        if blen >= LZ_MIN then
+            flushLits()
+            out[#out+1] = string.char(0x80 + blen - LZ_MIN, bdist - 1)
+            pos = pos + blen
+        else
+            lits[#lits+1] = input:sub(pos, pos)
+            pos = pos + 1
+            if #lits == 128 then flushLits() end
+        end
+    end
+    flushLits()
+    return table.concat(out)
+end
+
+local function lzDecompress(input)
+    local out = {}   -- array of single chars; index by position for back-refs
+    local pos = 1
+    local n   = #input
+    while pos <= n do
+        local flag = input:byte(pos); pos = pos + 1
+        if flag < 0x80 then
+            local cnt = flag + 1
+            for i = pos, pos + cnt - 1 do out[#out+1] = input:sub(i, i) end
+            pos = pos + cnt
+        else
+            local length = (flag - 0x80) + LZ_MIN
+            local dist   = input:byte(pos) + 1; pos = pos + 1
+            local from   = #out - dist + 1
+            for i = 0, length - 1 do
+                out[#out+1] = out[from + (i % dist)]
+            end
+        end
+    end
+    return table.concat(out)
+end
+
+local function compress(data)
+    local c = lzCompress(data)
+    -- Only use compressed form if it is actually smaller
+    if #c + #COMPRESS_MAGIC < #data then
+        return COMPRESS_MAGIC .. c
+    end
+    return data
+end
+
+local function decompress(data)
+    if data:sub(1, #COMPRESS_MAGIC) == COMPRESS_MAGIC then
+        return lzDecompress(data:sub(#COMPRESS_MAGIC + 1))
+    end
+    return data   -- uncompressed (old data or already small)
+end
+
 -- ── Core storage operations ────────────────────────────────────────────────
 
 local function opStore(key, data)
+    local payload = compress(data)
+    local ratio   = math.floor((1 - #payload / math.max(#data, 1)) * 100)
     local targets = pickNodes(REPLICATION)
     if #targets == 0 then return false, "No storage nodes available" end
 
     local written = {}
     for _, n in ipairs(targets) do
-        if n.free >= #data + 2048 then
-            local r = nodeRPC(n.id, {cmd="put", path=key, data=data}, NODE_TIMEOUT)
+        if n.free >= #payload + 2048 then
+            local r = nodeRPC(n.id, {cmd="put", path=key, data=payload}, NODE_TIMEOUT)
             if r and r.ok then
                 written[#written+1] = n.id
                 if nodes[n.id] then nodes[n.id].free = r.free or nodes[n.id].free end
@@ -287,7 +387,11 @@ local function opStore(key, data)
     if #written == 0 then return false, "No node had enough free space" end
     index[key] = written
     saveIndex()
-    log(("STORE '%s' → %d replica(s) | %dB"):format(key, #written, #data))
+    if ratio > 0 then
+        log(("STORE '%s' → %d rep | %dB→%dB (-%d%%)"):format(key, #written, #data, #payload, ratio))
+    else
+        log(("STORE '%s' → %d rep | %dB (no compression gain)"):format(key, #written, #data))
+    end
     return true, #written
 end
 
@@ -297,7 +401,9 @@ local function opRetrieve(key)
     for _, nid in ipairs(nodeIds) do
         if nodes[nid] then
             local r = nodeRPC(nid, {cmd="get", path=key}, NODE_TIMEOUT)
-            if r and r.ok and r.data ~= nil then return r.data end
+            if r and r.ok and r.data ~= nil then
+                return decompress(r.data)
+            end
         end
     end
     return nil, "All replicas unavailable (try rescan if nodes were restarted)"
