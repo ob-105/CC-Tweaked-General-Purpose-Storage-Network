@@ -3,7 +3,7 @@
 -- Set it as startup.lua or run manually: lua storage_server.lua
 -- Each computer provides ~1MB of frame storage.
 
-local VERSION    = "1.5.0"
+local VERSION    = "1.5.1"
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
 
 -- ── Auto-updater ───────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@
 --                       │  node 1 │       │  node 2 │   ...    │  node N │
 --                       └─────────┘       └─────────┘          └─────────┘
 --
-local VERSION    = "1.5.0"
+local VERSION    = "1.5.1"
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
 
 -- ── Auto-updater ───────────────────────────────────────────────────────────
