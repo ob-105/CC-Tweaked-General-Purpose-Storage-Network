@@ -7,25 +7,29 @@ local store = require("storage_api")
 local passed = 0
 local failed = 0
 
+local function setColour(c)
+    if term.isColour and term.isColour() then term.setTextColour(c) end
+end
+
 local function ok(name)
     passed = passed + 1
-    term.setTextColour and term.setTextColour(colours.lime)
+    setColour(colours.lime)
     print("  [PASS] " .. name)
-    term.setTextColour and term.setTextColour(colours.white)
+    setColour(colours.white)
 end
 
 local function fail(name, reason)
     failed = failed + 1
-    term.setTextColour and term.setTextColour(colours.red)
-    print("  [FAIL] " .. name .. " — " .. tostring(reason))
-    term.setTextColour and term.setTextColour(colours.white)
+    setColour(colours.red)
+    print("  [FAIL] " .. name .. " -- " .. tostring(reason))
+    setColour(colours.white)
 end
 
 local function section(name)
     print()
-    term.setTextColour and term.setTextColour(colours.yellow)
+    setColour(colours.yellow)
     print(">> " .. name)
-    term.setTextColour and term.setTextColour(colours.white)
+    setColour(colours.white)
 end
 
 -- ── 1. Controller reachability ─────────────────────────────────────────────
@@ -128,10 +132,10 @@ else fail("Keys removed after delete", "key still exists") end
 print()
 print(string.rep("=", 40))
 if failed == 0 then
-    term.setTextColour and term.setTextColour(colours.lime)
+    setColour(colours.lime)
     print(("All %d tests passed! Network is working."):format(passed))
 else
-    term.setTextColour and term.setTextColour(colours.red)
+    setColour(colours.red)
     print(("%d passed, %d FAILED"):format(passed, failed))
     print()
     print("Troubleshooting:")
@@ -140,4 +144,4 @@ else
     print("  - Check all modems are attached and cables are connected")
     print("  - Try pressing R on the controller to rescan nodes")
 end
-term.setTextColour and term.setTextColour(colours.white)
+setColour(colours.white)
