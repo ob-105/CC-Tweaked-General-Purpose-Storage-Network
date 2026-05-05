@@ -19,7 +19,7 @@
 --   store.delete("config/motd")
 --
 
-local VERSION    = "1.4.0"
+local VERSION    = "1.5.0"
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
 
 -- ── Auto-updater ───────────────────────────────────────────────────────────

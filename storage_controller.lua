@@ -12,7 +12,7 @@
 --                       │  node 1 │       │  node 2 │   ...    │  node N │
 --                       └─────────┘       └─────────┘          └─────────┘
 --
-local VERSION    = "1.4.0"
+local VERSION    = "1.5.0"
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
 
 -- ── Auto-updater ───────────────────────────────────────────────────────────
@@ -408,18 +408,22 @@ end
 -- ── Core storage operations ────────────────────────────────────────────────
 
 local function opStore(key, data)
-    local payload = compress(data)
-    local ratio   = math.floor((1 - #payload / math.max(#data, 1)) * 100)
+    -- Compression is now handled by each storage node (see storage_server.lua).
+    -- We send raw data + compress=true; the node compresses before writing and
+    -- decompresses before returning, keeping the controller's CPU free.
     local targets = pickNodes(REPLICATION)
     if #targets == 0 then return false, "No storage nodes available" end
 
-    local written = {}
+    local written  = {}
+    local storedSz = #data  -- updated from first successful reply
     for _, n in ipairs(targets) do
-        if n.free >= #payload + 2048 then
-            local r = nodeRPC(n.id, {cmd="put", path=key, data=payload}, NODE_TIMEOUT)
+        -- Use raw size as a conservative space estimate (compressed <= raw)
+        if n.free >= #data + 2048 then
+            local r = nodeRPC(n.id, {cmd="put", path=key, data=data, compress=true}, NODE_TIMEOUT)
             if r and r.ok then
                 written[#written+1] = n.id
                 if nodes[n.id] then nodes[n.id].free = r.free or nodes[n.id].free end
+                if r.stored and r.stored < storedSz then storedSz = r.stored end
             end
         end
     end
@@ -427,10 +431,11 @@ local function opStore(key, data)
     if #written == 0 then return false, "No node had enough free space" end
     index[key] = written
     saveIndex()
+    local ratio = math.floor((1 - storedSz / math.max(#data, 1)) * 100)
     if ratio > 0 then
-        log(("STORE '%s' → %d rep | %dB→%dB (-%d%%)"):format(key, #written, #data, #payload, ratio))
+        log(("STORE '%s' \u2192 %d rep | %dB\u2192%dB (-%d%%)"):format(key, #written, #data, storedSz, ratio))
     else
-        log(("STORE '%s' → %d rep | %dB (no compression gain)"):format(key, #written, #data))
+        log(("STORE '%s' \u2192 %d rep | %dB (no compression gain)"):format(key, #written, #data))
     end
     return true, #written
 end
@@ -442,7 +447,8 @@ local function opRetrieve(key)
         if nodes[nid] then
             local r = nodeRPC(nid, {cmd="get", path=key}, NODE_TIMEOUT)
             if r and r.ok and r.data ~= nil then
-                return decompress(r.data)
+                -- Node decompresses before returning; data is already plaintext.
+                return r.data
             end
         end
     end
