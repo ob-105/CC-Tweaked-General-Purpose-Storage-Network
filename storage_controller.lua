@@ -12,7 +12,7 @@
 --                       │  node 1 │       │  node 2 │   ...    │  node N │
 --                       └─────────┘       └─────────┘          └─────────┘
 --
-local VERSION    = "1.1.1"
+local VERSION    = "1.2.0"
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
 
 -- ── Auto-updater ───────────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ end
 autoUpdate()
 
 -- CONFIG ──────────────────────────────────────────────────────────────────
-local REPLICATION   = 2    -- how many nodes to write each key to
+local REPLICATION   = 2    -- default; overridden at runtime by settings file
 local RESCAN_EVERY  = 60   -- seconds between automatic node rescans
 local NODE_TIMEOUT  = 5    -- seconds to wait for a node RPC response
 -- ─────────────────────────────────────────────────────────────────────────
@@ -60,9 +60,10 @@ local inMenu = false        -- true while a menu is open (pauses log redraws)
 local function colour(c) if term.isColour() then term.setTextColour(c) end end
 local function resetColour() colour(colours.white) end
 
-local NODE_PROTOCOL = "cct-media-store"   -- controller <-> storage nodes
-local CTRL_PROTOCOL = "cct-store-ctrl"    -- clients    <-> controller
-local INDEX_FILE    = "ctrl_index.dat"    -- persisted key->node index
+local NODE_PROTOCOL   = "cct-media-store"   -- controller <-> storage nodes
+local CTRL_PROTOCOL   = "cct-store-ctrl"    -- clients    <-> controller
+local INDEX_FILE      = "ctrl_index.dat"    -- persisted key->node index
+local SETTINGS_FILE   = "ctrl_settings.dat" -- persisted runtime settings
 
 -- ── State ──────────────────────────────────────────────────────────────────
 local nodes    = {}   -- [id] -> {id, label, free, cap}
@@ -162,6 +163,23 @@ local function openModems()
         end
     end
     return n
+end
+
+-- ── Settings persistence ──────────────────────────────────────────────────
+local function saveSettings()
+    local f = fs.open(SETTINGS_FILE, "w")
+    f.write(textutils.serialize({replication = REPLICATION}))
+    f.close()
+end
+
+local function loadSettings()
+    if not fs.exists(SETTINGS_FILE) then return end
+    local f = fs.open(SETTINGS_FILE, "r")
+    local raw = f.readAll(); f.close()
+    local t = textutils.unserialize(raw)
+    if type(t) == "table" and type(t.replication) == "number" then
+        REPLICATION = t.replication
+    end
 end
 
 -- ── Index persistence ──────────────────────────────────────────────────────
@@ -535,6 +553,41 @@ local function menuWipeAll()
     pause()
 end
 
+-- Change the replication factor
+local function menuSettings()
+    menuHeader("Settings")
+    print("Replication factor: how many nodes each key is written to.")
+    print("Higher = more redundancy, less usable space.")
+    print()
+    colour(colours.cyan)
+    print("  Current: " .. REPLICATION .. "x")
+    resetColour()
+    print()
+    print("  1.  No redundancy  (1x) — maximum storage, no fault tolerance")
+    print("  2.  Standard       (2x) — one node can fail  [recommended]")
+    print("  3.  High           (3x) — two nodes can fail")
+    print("  4.  Maximum        (4x) — three nodes can fail")
+    print("  0.  Cancel")
+    print()
+    io.write("Choice: ")
+    local c = tonumber(io.read())
+    if c and c >= 1 and c <= 4 then
+        local nodeCount = 0; for _ in pairs(nodes) do nodeCount = nodeCount + 1 end
+        if c > nodeCount then
+            colour(colours.yellow)
+            print(("Warning: only %d node(s) online — replication will be capped at that."):format(nodeCount))
+            resetColour()
+        end
+        REPLICATION = c
+        saveSettings()
+        log(("Settings: replication set to %dx"):format(REPLICATION))
+        colour(colours.lime); print("Saved."); resetColour()
+    elseif c ~= 0 then
+        colour(colours.red); print("Invalid choice."); resetColour()
+    end
+    pause()
+end
+
 -- Top-level management menu
 local function managementMenu()
     inMenu = true
@@ -546,6 +599,7 @@ local function managementMenu()
         print("  4. Rescan nodes")
         print("  5. Wipe a single node")
         print("  6. WIPE ALL storage")
+        print("  7. Settings (replication: " .. REPLICATION .. "x)")
         print("  0. Back to monitor")
         print()
         io.write("Choice: ")
@@ -562,6 +616,7 @@ local function managementMenu()
             pause()
         elseif c == "5" then menuWipeNode()
         elseif c == "6" then menuWipeAll()
+        elseif c == "7" then menuSettings()
         elseif c == "0" or c == "" then break
         end
     end
@@ -607,6 +662,7 @@ if openModems() == 0 then
     error("No modem found! Attach a wired modem and connect cables to your storage nodes.")
 end
 
+loadSettings()
 loadIndex()
 local keyCount = 0; for _ in pairs(index) do keyCount = keyCount + 1 end
 
