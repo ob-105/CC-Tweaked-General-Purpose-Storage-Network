@@ -433,9 +433,9 @@ local function opStore(key, data)
     saveIndex()
     local ratio = math.floor((1 - storedSz / math.max(#data, 1)) * 100)
     if ratio > 0 then
-        log(("STORE '%s' \u2192 %d rep | %dB\u2192%dB (-%d%%)"):format(key, #written, #data, storedSz, ratio))
+        log(("STORE '%s' -> %d rep | %dB->%dB (-%d%%)"):format(key, #written, #data, storedSz, ratio))
     else
-        log(("STORE '%s' \u2192 %d rep | %dB (no compression gain)"):format(key, #written, #data))
+        log(("STORE '%s' -> %d rep | %dB (no compression gain)"):format(key, #written, #data))
     end
     return true, #written
 end
