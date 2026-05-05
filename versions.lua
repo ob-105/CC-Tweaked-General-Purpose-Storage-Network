@@ -3,6 +3,6 @@
 -- on all computers running the matching script.
 return {
     server     = "1.5.1",
-    controller = "1.5.1",
+    controller = "1.5.2",
     api        = "1.5.1",
 }
