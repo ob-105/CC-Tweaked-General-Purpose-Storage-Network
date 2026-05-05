@@ -3,7 +3,7 @@
 -- Set it as startup.lua or run manually: lua storage_server.lua
 -- Each computer provides ~1MB of frame storage.
 
-local VERSION    = "1.1.0"
+local VERSION    = "1.4.0"
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
 
 -- ── Auto-updater ───────────────────────────────────────────────────────────
@@ -118,6 +118,80 @@ local function handle(sender, msg)
 
     elseif cmd == "free" then
         rednet.send(sender, {ok=true, free=fs.getFreeSpace("/")}, PROTOCOL)
+
+    elseif cmd == "task" then
+        -- Execute a Lua function string in a sandboxed environment.
+        -- The code must be a function body (not a bare expression).
+        -- The sandbox provides read-only access to this node's stored files
+        -- and standard Lua libs, but NO filesystem writes, rednet, or http.
+        local unpack_ = table.unpack or unpack
+        local sandbox = {
+            -- Standard safe libs
+            math      = math,
+            string    = string,
+            table     = table,
+            textutils = textutils,
+            pairs     = pairs,
+            ipairs    = ipairs,
+            tostring  = tostring,
+            tonumber  = tonumber,
+            type      = type,
+            pcall     = pcall,
+            error     = error,
+            select    = select,
+            unpack    = unpack_,
+            os        = {clock=os.clock, time=os.time, date=os.date},
+            -- Node identity
+            nodeId    = ID,
+            nodeLabel = LABEL,
+            nodeFree  = fs.getFreeSpace("/"),
+            nodeCap   = fs.getCapacity("/"),
+            -- Read-only access to files stored on this node
+            readFile  = function(path)
+                local p = "store/"..tostring(path)
+                if not fs.exists(p) then return nil end
+                local f = fs.open(p, "r")
+                local d = f.readAll(); f.close()
+                return d
+            end,
+            listFiles = function(prefix)
+                local results = {}
+                walk("store", results)
+                if prefix then
+                    local filtered = {}
+                    for _, v in ipairs(results) do
+                        if v:sub(1, #prefix) == prefix then
+                            filtered[#filtered+1] = v
+                        end
+                    end
+                    return filtered
+                end
+                return results
+            end,
+        }
+        sandbox._ENV = sandbox
+
+        local code = msg.code or ""
+        local fn, compErr = load(code, "task", "t", sandbox)
+        if not fn then
+            rednet.send(sender, {ok=false, err="Compile error: "..tostring(compErr)}, PROTOCOL)
+            return
+        end
+
+        local args = msg.args or {}
+        local ok2, result = pcall(fn, unpack_(args))
+        if not ok2 then
+            rednet.send(sender, {ok=false, err=tostring(result)}, PROTOCOL)
+            return
+        end
+
+        -- Serialize result so it survives rednet transmission
+        local ok3, serialized = pcall(textutils.serialize, result)
+        if not ok3 then
+            rednet.send(sender, {ok=false, err="Task result is not serializable"}, PROTOCOL)
+            return
+        end
+        rednet.send(sender, {ok=true, result=serialized}, PROTOCOL)
     end
 end
 

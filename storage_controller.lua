@@ -12,7 +12,7 @@
 --                       │  node 1 │       │  node 2 │   ...    │  node N │
 --                       └─────────┘       └─────────┘          └─────────┘
 --
-local VERSION    = "1.3.0"
+local VERSION    = "1.4.0"
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
 
 -- ── Auto-updater ───────────────────────────────────────────────────────────
@@ -279,15 +279,22 @@ end
 --   flag >= 0x80 → back-ref:     length = (flag-0x80)+3, dist = next_byte+1
 
 local COMPRESS_MAGIC = "\27LZ"
-local LZ_MIN   = 3
-local LZ_MAX   = 130   -- 7 low bits of flag + LZ_MIN
-local LZ_WIN   = 256   -- 8-bit offset field
+local LZ_MIN     = 3
+local LZ_MAX     = 130   -- 7 bits of flag + LZ_MIN
+local LZ_WIN     = 255   -- 8-bit distance field (dist stored as dist-1)
+local MAX_CANDS  = 4     -- hash bucket size — limits work per position to O(1)
 
 local function lzCompress(input)
     local n = #input
-    local pos = 1
-    local lits = {}
+    if n == 0 then return "" end
+
+    -- Pre-load all bytes into a table — table[i] is far faster than
+    -- input:byte(i) inside tight loops in Lua 5.1.
+    local b = {input:byte(1, n)}
+
+    local ht   = {}   -- hash key -> array of up to MAX_CANDS positions
     local out  = {}
+    local lits = {}
 
     local function flushLits()
         if #lits == 0 then return end
@@ -301,24 +308,53 @@ local function lzCompress(input)
         lits = {}
     end
 
+    local function hashAdd(p)
+        if p + 1 > n then return end
+        local k = b[p] * 256 + b[p + 1]
+        local t = ht[k]
+        if not t then ht[k] = {p}; return end
+        if #t >= MAX_CANDS then table.remove(t, 1) end
+        t[#t + 1] = p
+    end
+
+    local pos = 1
     while pos <= n do
-        local wstart = math.max(1, pos - LZ_WIN)
-        local bdist, blen = 0, 0
-        for i = wstart, pos - 1 do
-            local len = 0
-            while len < LZ_MAX and pos + len <= n
-                  and input:byte(i + len) == input:byte(pos + len) do
-                len = len + 1
+        local blen, bdist = 0, 0
+
+        if pos + LZ_MIN - 1 <= n then
+            local k = b[pos] * 256 + b[pos + 1]
+            local cands = ht[k]
+            if cands then
+                local maxl = math.min(LZ_MAX, n - pos)
+                for ci = #cands, 1, -1 do   -- most-recent first
+                    local cp   = cands[ci]
+                    local dist = pos - cp
+                    if dist > 0 and dist <= LZ_WIN then
+                        -- Quick 3rd-byte pre-check before committing to a scan
+                        if b[cp + 2] == b[pos + 2] then
+                            local len = 2
+                            while len < maxl and b[cp + len] == b[pos + len] do
+                                len = len + 1
+                            end
+                            if len > blen then
+                                blen = len; bdist = dist
+                                if blen == LZ_MAX then break end
+                            end
+                        end
+                    end
+                end
             end
-            if len > blen then blen = len; bdist = pos - i end
         end
+
+        hashAdd(pos)
 
         if blen >= LZ_MIN then
             flushLits()
             out[#out+1] = string.char(0x80 + blen - LZ_MIN, bdist - 1)
+            for i = 1, blen - 1 do hashAdd(pos + i) end
             pos = pos + blen
         else
-            lits[#lits+1] = input:sub(pos, pos)
+            lits[#lits+1] = string.char(b[pos])
             pos = pos + 1
             if #lits == 128 then flushLits() end
         end
@@ -328,21 +364,26 @@ local function lzCompress(input)
 end
 
 local function lzDecompress(input)
-    local out = {}   -- array of single chars; index by position for back-refs
-    local pos = 1
-    local n   = #input
+    local n      = #input
+    local out    = {}
+    local outlen = 0
+    local pos    = 1
     while pos <= n do
         local flag = input:byte(pos); pos = pos + 1
         if flag < 0x80 then
             local cnt = flag + 1
-            for i = pos, pos + cnt - 1 do out[#out+1] = input:sub(i, i) end
+            for i = pos, pos + cnt - 1 do
+                outlen = outlen + 1
+                out[outlen] = input:sub(i, i)
+            end
             pos = pos + cnt
         else
             local length = (flag - 0x80) + LZ_MIN
             local dist   = input:byte(pos) + 1; pos = pos + 1
-            local from   = #out - dist + 1
+            local from   = outlen - dist + 1
             for i = 0, length - 1 do
-                out[#out+1] = out[from + (i % dist)]
+                outlen = outlen + 1
+                out[outlen] = out[from + (i % dist)]
             end
         end
     end
@@ -351,7 +392,6 @@ end
 
 local function compress(data)
     local c = lzCompress(data)
-    -- Only use compressed form if it is actually smaller
     if #c + #COMPRESS_MAGIC < #data then
         return COMPRESS_MAGIC .. c
     end
@@ -362,7 +402,7 @@ local function decompress(data)
     if data:sub(1, #COMPRESS_MAGIC) == COMPRESS_MAGIC then
         return lzDecompress(data:sub(#COMPRESS_MAGIC + 1))
     end
-    return data   -- uncompressed (old data or already small)
+    return data
 end
 
 -- ── Core storage operations ────────────────────────────────────────────────
@@ -453,6 +493,77 @@ local function opStats()
     }
 end
 
+-- ── Task execution ─────────────────────────────────────────────────────────────
+-- Run code on one node (the one with the most free space).
+-- Returns: result_value, nil   OR   nil, error_string
+local function opTask(code, args, timeout)
+    -- Pick the node with most free space as the worker
+    local target = nil
+    for _, n in pairs(nodes) do
+        if not target or n.free > target.free then target = n end
+    end
+    if not target then return nil, "No nodes available" end
+
+    log(("TASK dispatched to '%s'"):format(target.label))
+    local r = nodeRPC(target.id, {cmd="task", code=code, args=args or {}}, timeout or 30)
+    if not r then return nil, "Node did not respond" end
+    if not r.ok then return nil, r.err or "Task failed" end
+    local val = textutils.unserialize(r.result)
+    return val
+end
+
+-- Run code on ALL nodes simultaneously (sequential dispatch, parallel in effect
+-- since each node works independently while we wait for the next response).
+-- Returns an array: { {id, label, result}, ... } for successful nodes
+--                   { {id, label, err},    ... } for failed ones
+local function opTaskAll(code, args, timeout)
+    local nodeList = {}
+    for _, n in pairs(nodes) do nodeList[#nodeList+1] = n end
+    if #nodeList == 0 then return nil, "No nodes available" end
+
+    -- Send requests to all nodes first, then collect replies
+    for _, n in ipairs(nodeList) do
+        rednet.send(n.id, {cmd="task", code=code, args=args or {}}, NODE_PROTOCOL)
+    end
+
+    local results  = {}
+    local deadline = os.clock() + (timeout or 30)
+    local pending  = {}
+    for _, n in ipairs(nodeList) do pending[n.id] = n end
+
+    log(("TASKALL dispatched to %d node(s)"):format(#nodeList))
+
+    local timerId = os.startTimer(deadline - os.clock())
+    while next(pending) do
+        local ev, a, b, c = os.pullEvent()
+        if ev == "rednet_message" and c == NODE_PROTOCOL then
+            local n = pending[a]
+            if n then
+                pending[a] = nil
+                if type(b) == "table" and b.ok then
+                    results[#results+1] = {id=n.id, label=n.label,
+                        result=textutils.unserialize(b.result)}
+                else
+                    results[#results+1] = {id=n.id, label=n.label,
+                        err=(type(b)=="table" and b.err) or "No response"}
+                end
+            else
+                -- Not a pending task reply — buffer for other handlers
+                msgQueue[#msgQueue+1] = {sender=a, msg=b, proto=c}
+            end
+        elseif ev == "rednet_message" then
+            msgQueue[#msgQueue+1] = {sender=a, msg=b, proto=c}
+        elseif ev == "timer" and a == timerId then
+            -- Timed-out nodes get an error entry
+            for nid, n in pairs(pending) do
+                results[#results+1] = {id=nid, label=n.label, err="Timed out"}
+            end
+            break
+        end
+    end
+    return results
+end
+
 -- ── Handle a single client request ─────────────────────────────────────────
 local function handleClient(sender, msg)
     local cmd = msg.cmd
@@ -498,6 +609,22 @@ local function handleClient(sender, msg)
         scanNodes()
         local count = 0; for _ in pairs(nodes) do count = count + 1 end
         rednet.send(sender, {ok=true, nodeCount=count}, CTRL_PROTOCOL)
+
+    elseif cmd == "task" then
+        if type(msg.code) ~= "string" or msg.code == "" then
+            return rednet.send(sender, {ok=false, err="'code' must be a non-empty string"}, CTRL_PROTOCOL)
+        end
+        local result, err = opTask(msg.code, msg.args, msg.timeout)
+        if err then rednet.send(sender, {ok=false, err=err}, CTRL_PROTOCOL)
+        else        rednet.send(sender, {ok=true, result=result}, CTRL_PROTOCOL) end
+
+    elseif cmd == "taskAll" then
+        if type(msg.code) ~= "string" or msg.code == "" then
+            return rednet.send(sender, {ok=false, err="'code' must be a non-empty string"}, CTRL_PROTOCOL)
+        end
+        local results, err = opTaskAll(msg.code, msg.args, msg.timeout)
+        if not results then rednet.send(sender, {ok=false, err=err}, CTRL_PROTOCOL)
+        else               rednet.send(sender, {ok=true, results=results}, CTRL_PROTOCOL) end
     end
 end
 

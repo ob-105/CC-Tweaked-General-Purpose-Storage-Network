@@ -19,7 +19,7 @@
 --   store.delete("config/motd")
 --
 
-local VERSION    = "1.1.0"
+local VERSION    = "1.4.0"
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
 
 -- ── Auto-updater ───────────────────────────────────────────────────────────
@@ -175,6 +175,67 @@ function M.rescan()
     local r, err = rpc({cmd="rescan"}, 15)
     if not r then return false, err end
     return r.ok, r.nodeCount
+end
+
+-- store.task(code, [args], [timeout])
+-- Run a Lua function on one storage node and return the result.
+--
+-- 'code' is a string containing a Lua function body (return a value at the end).
+-- 'args' is an optional table of arguments passed to the function.
+-- 'timeout' is optional seconds to wait (default 30).
+--
+-- Inside the task the following globals are available:
+--   math, string, table, textutils, pairs, ipairs, tostring, tonumber, type,
+--   pcall, error, os.clock/time/date
+--   nodeId, nodeLabel, nodeFree, nodeCap
+--   readFile(path)  -- read a file stored on this node (returns string or nil)
+--   listFiles([prefix]) -- list files stored on this node
+--
+-- Returns: result_value   OR   nil, errorMessage
+--
+-- EXAMPLE -- count files stored across one node:
+--   local count = store.task("return #listFiles()")
+--
+-- EXAMPLE -- find all keys matching a prefix on one node:
+--   local keys = store.task("return listFiles('players/')")
+function M.task(code, args, timeout)
+    local r, err = rpc({cmd="task", code=code, args=args, timeout=timeout},
+                        (timeout or 30) + 5)
+    if not r then return nil, err end
+    if r.ok then return r.result end
+    return nil, r.err
+end
+
+-- store.taskAll(code, [args], [timeout])
+-- Run a Lua function on ALL storage nodes simultaneously.
+-- Returns an array of results, one per node:
+--   { {id, label, result}, ... }  for nodes that succeeded
+--   { {id, label, err},    ... }  for nodes that failed or timed out
+--
+-- Use this for map-reduce style work: each node processes its own data,
+-- then you aggregate the results in your script.
+--
+-- EXAMPLE -- total files across all nodes:
+--   local results = store.taskAll("return #listFiles()")
+--   local total = 0
+--   for _, r in ipairs(results) do
+--       if r.result then total = total + r.result end
+--   end
+--   print("Total files: " .. total)
+--
+-- EXAMPLE -- collect all player keys from every node:
+--   local results = store.taskAll("return listFiles('players/')")
+--   for _, r in ipairs(results) do
+--       if r.result then
+--           for _, key in ipairs(r.result) do print(r.label .. ": " .. key) end
+--       end
+--   end
+function M.taskAll(code, args, timeout)
+    local r, err = rpc({cmd="taskAll", code=code, args=args, timeout=timeout},
+                        (timeout or 30) + 5)
+    if not r then return nil, err end
+    if r.ok then return r.results end
+    return nil, r.err
 end
 
 -- store.reconnect()
