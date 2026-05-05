@@ -12,7 +12,7 @@
 --                       │  node 1 │       │  node 2 │   ...    │  node N │
 --                       └─────────┘       └─────────┘          └─────────┘
 --
-local VERSION    = "1.1.0"
+local VERSION    = "1.1.1"
 local GITHUB_RAW = "https://raw.githubusercontent.com/ob-105/CC-Tweaked-General-Purpose-Storage-Network/main"
 
 -- ── Auto-updater ───────────────────────────────────────────────────────────
@@ -206,18 +206,35 @@ end
 
 -- ── Node RPC ───────────────────────────────────────────────────────────────
 -- Sends a request to a specific node and waits for its reply.
--- Buffers responses from other nodes so they aren't lost.
+-- Uses os.pullEvent directly so it always yields, avoiding "too long without
+-- yielding" errors when multiple node responses arrive back-to-back.
 local function nodeRPC(nodeId, req, timeout)
     rednet.send(nodeId, req, NODE_PROTOCOL)
     local deadline = os.clock() + (timeout or NODE_TIMEOUT)
-    while os.clock() > 0 do   -- loop until deadline
-        local remaining = deadline - os.clock()
-        if remaining <= 0 then break end
-        local sender, resp = queuedReceive(NODE_PROTOCOL, remaining)
-        if not sender then break end                -- timed out
-        if sender == nodeId then return resp end    -- got our reply
-        -- Response from a different node - buffer it
-        msgQueue[#msgQueue+1] = {sender=sender, msg=resp, proto=NODE_PROTOCOL}
+
+    -- Check the existing buffer first (responses buffered from earlier calls)
+    for i, e in ipairs(msgQueue) do
+        if e.proto == NODE_PROTOCOL and e.sender == nodeId then
+            table.remove(msgQueue, i)
+            return e.msg
+        end
+    end
+
+    -- Wait for new events until we get our reply or time out
+    local timerId = os.startTimer(deadline - os.clock())
+    while true do
+        local ev, a, b, c = os.pullEvent()
+        if ev == "rednet_message" then
+            if c == NODE_PROTOCOL and a == nodeId then
+                os.cancelTimer(timerId)
+                return b                        -- our reply
+            elseif c ~= nil then
+                -- Buffer it for other callers
+                msgQueue[#msgQueue+1] = {sender=a, msg=b, proto=c}
+            end
+        elseif ev == "timer" and a == timerId then
+            break                               -- timed out
+        end
     end
     return nil
 end
